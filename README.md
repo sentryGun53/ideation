@@ -4,11 +4,11 @@ main logic is in histogram.c
 
 
 RUN:
-make
+make;
 ./h
 
 ADJUST LEVELS:
-alsamixer -c 1
+alsamixer -c 1;
 sudo alsactl store
 
 SPEAKER TEST:
