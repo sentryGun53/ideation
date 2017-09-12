@@ -1,0 +1,330 @@
+/*
+
+RUN:
+    make
+    ./f
+
+ADJUST LEVELS:
+    alsamixer -c 1
+    sudo alsactl store
+
+SPEAKER TEST:
+    speaker-test -c2 -D plughw:1,0
+
+*/
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <math.h>
+
+#include <alsa/asoundlib.h>
+#include "mailbox.h"
+#include "gpu_fft.h"
+
+#include "VG/openvg.h"
+#include "VG/vgu.h"
+#include "fontinfo.h"
+#include "shapes.h"
+
+#include <wiringSerial.h>
+
+
+#define NUM_BINS       26
+#define BAR_WIDTH      30
+#define BAR_SPACING    5
+#define GRAPH_ORIGIN_X 100
+#define GRAPH_ORIGIN_Y 100
+
+#define PI 3.1415926535
+
+
+void serial_send(int fd, char bar_num, int brightness) {
+  char header = 255 - bar_num;
+  if (brightness < 0) brightness = 0;
+  if (brightness > 255-8) brightness = 255-8;
+  char value = brightness;
+  serialPutchar(fd, header);
+  serialPutchar(fd, value);
+  printf("header=%d, value=%d\n", header, value);
+
+}
+
+
+int main ()
+{
+
+    // gpu-fft varaibles
+    int log2_N = 11;
+    int N = 2048;
+    int mb = mbox_open();
+    struct GPU_FFT *fft;
+
+    // alsa variables
+    int buffer_frames = N;
+    unsigned int rate = 44100;  // supports 44100, 32000, 11025, 8000, 5512
+    char *device = "plughw:1,0";
+    int err;
+    char *buffer;
+    snd_pcm_t *capture_handle;
+    snd_pcm_hw_params_t *hw_params;
+    snd_pcm_format_t format = SND_PCM_FORMAT_S16_LE;
+
+
+    // openVG setup
+    int width, height;
+    init(&width, &height);                  // Graphics initialization
+    printf("width=%d, height=%d\n", width, height);
+
+
+
+    // build hanning window
+    float hanning_window[N];
+    for (int n = 0; n < N; n++) {
+        hanning_window[n] = 0.5 * (1 - cos(2.0*PI*n/(N-1)));
+    }
+
+    float bins[NUM_BINS];    // a reduced histogram of the FFT output data
+    float bins_smoothed[NUM_BINS];
+    float bins_smoothed_old[NUM_BINS];
+    memset(bins_smoothed, 0, sizeof(float) * NUM_BINS);
+    memset(bins_smoothed_old, 0, sizeof(float) * NUM_BINS);
+
+    float diffs[NUM_BINS];
+
+
+    // serial setup
+    int arduino = serialOpen("/dev/ttyACM0", 115200);
+
+    // /********* SETUP  *********/
+
+    if ((err = snd_pcm_open (&capture_handle, device, SND_PCM_STREAM_CAPTURE, 0)) < 0) {
+        fprintf (stderr, "cannot open audio device %s (%s)\n", device, snd_strerror (err));
+        exit (1);
+    }
+    if ((err = snd_pcm_hw_params_malloc (&hw_params)) < 0) {
+        fprintf (stderr, "cannot allocate hardware parameter structure (%s)\n", snd_strerror (err));
+        exit (1);
+    }
+    if ((err = snd_pcm_hw_params_any (capture_handle, hw_params)) < 0) {
+        fprintf (stderr, "cannot initialize hardware parameter structure (%s)\n", snd_strerror (err));
+        exit (1);
+    }
+    if ((err = snd_pcm_hw_params_set_access (capture_handle, hw_params, SND_PCM_ACCESS_RW_INTERLEAVED)) < 0) {
+        fprintf (stderr, "cannot set access type (%s)\n", snd_strerror (err));
+        exit (1);
+    }
+    if ((err = snd_pcm_hw_params_set_format (capture_handle, hw_params, format)) < 0) {
+        fprintf (stderr, "cannot set sample format (%s)\n", snd_strerror (err));
+        exit (1);
+    }
+    if ((err = snd_pcm_hw_params_set_rate_near (capture_handle, hw_params, &rate, 0)) < 0) {
+        fprintf (stderr, "cannot set sample rate (%s)\n", snd_strerror (err));
+        exit (1);
+    }
+    if ((err = snd_pcm_hw_params_set_channels (capture_handle, hw_params, 2)) < 0) {
+        fprintf (stderr, "cannot set channel count (%s)\n", snd_strerror (err));
+        exit (1);
+    }
+    if ((err = snd_pcm_hw_params (capture_handle, hw_params)) < 0) {
+        fprintf (stderr, "cannot set parameters (%s)\n", snd_strerror (err));
+        exit (1);
+    }
+    snd_pcm_hw_params_free (hw_params);
+    if ((err = snd_pcm_prepare (capture_handle)) < 0) {
+        fprintf (stderr, "cannot prepare audio interface for use (%s)\n", snd_strerror (err));
+        exit (1);
+    }
+
+
+
+
+
+
+    printf("setup complete!\n");
+
+
+    int accumulator[15];
+    int prev_i = 0;
+
+    int lights[8];
+    int output_levels[8];
+
+    int slide_up_val = 0;
+    int slide_down_val = 0;
+
+
+    /********* MAIN  *********/
+
+    buffer = malloc(buffer_frames * snd_pcm_format_width(format) / 8 * 2);
+
+    for (int iteration = 0; iteration < 10000; iteration++) {
+
+        snd_pcm_reset(capture_handle);
+
+        // get a buffer's with of audio from the microphone via ALSA
+        if ((err = snd_pcm_readi (capture_handle, buffer, buffer_frames)) != buffer_frames) {
+            fprintf (stderr, "read from audio interface failed (%s)\n", snd_strerror (err));
+            exit (1);
+        }
+
+        gpu_fft_prepare(mb, log2_N, GPU_FFT_FWD, 1, &fft);
+
+
+        // copy audio buffer data into FFT->in
+        for (int i = 0; i < N; i++) {
+            fft->in[i].re = buffer[i] * hanning_window[i];
+            // fft->in[i].re = buffer[i];
+            fft->in[i].im = 0;
+        }
+
+        // run the fft on the GPU
+        gpu_fft_execute(fft);
+
+        // copy first half of FFT output into bars (reduce # of bins)
+        for (int i = 0; i < NUM_BINS; i++) {
+            bins_smoothed_old[i] = bins_smoothed[i];
+
+            float magnitude = sqrt(pow(fft->out[i].re, 2) + pow(fft->out[i].im, 2));
+            // bins[i] = log10(magnitude);
+            bins[i] = (magnitude);
+            if (bins[i] > bins_smoothed[i]) {
+                bins_smoothed[i] = bins[i];
+            } else {
+                bins_smoothed[i] = 0.95 * bins_smoothed[i] + 0.05 * bins[i];
+            }
+
+            diffs[i] = bins_smoothed[i] - bins_smoothed_old[i];
+        }
+
+        gpu_fft_release(fft); // Videocore memory lost if not freed !
+
+
+        Start(width, height);                   // Start the picture
+        Background(0, 0, 0);                    // Black background
+        Fill(44, 77, 232, 1);                   // Big blue marble
+
+        // display histogram bins
+
+
+        int biggest_jump = -1;
+        int biggest_jump_i = -1;
+
+        for (int j = 0; j < NUM_BINS; j++) {
+            int x = GRAPH_ORIGIN_X + (BAR_SPACING + BAR_WIDTH) * j;
+            int y = GRAPH_ORIGIN_Y;
+            int h =  bins_smoothed[j] / 30;
+            Roundrect(x, y, BAR_WIDTH, h, 10, 10);
+
+            int jump = fmax(0, diffs[j] / 30);
+            if (jump > biggest_jump) {
+                biggest_jump = jump;
+                biggest_jump_i = j;
+            }
+        }
+
+
+
+
+        for (int i = 14; i >= 1; i--) {
+            accumulator[i] = accumulator[i-1];
+        }
+        accumulator[0] = 0;
+
+        if (biggest_jump > 60 && biggest_jump_i >= 2 && biggest_jump_i <= 24) {
+            if (biggest_jump_i > prev_i) {
+                accumulator[0] = 1;
+            } else if (biggest_jump_i < prev_i) {
+                accumulator[0] = -1;
+            }
+            prev_i = biggest_jump_i;
+
+        }
+
+
+        int sum = 0;
+        for (int i = 0; i < 15; i++) {
+            sum += accumulator[i];
+        }
+
+
+        int upper_diff_sum = 0;
+        int lower_diff_sum = 0;
+
+        for (int i = 2; i < 10; i++) {
+            lower_diff_sum += diffs[i];
+        }
+        for (int i = 11; i < 24; i++) {
+            upper_diff_sum += diffs[i];
+        }
+
+
+        if (sum >= 3 && slide_up_val < 20) {
+            // printf("SLIDE UP\n");
+            slide_up_val = 255;
+        } else if (sum <= -3 && slide_down_val < 20) {
+            // printf("           SLIDE DOWN\n");
+            slide_down_val = 255;
+        // } else if (upper_diff_sum - lower_diff_sum > 10000) {
+        //     printf("                      HIGH CLAP\n");
+        // } else if (lower_diff_sum - upper_diff_sum > 10000) {
+        //     printf("                                 LOW CLAP\n");
+        // } else if (lower_diff_sum + upper_diff_sum > 4000 ) {
+        //     printf("                                            CLAP\n");
+        }
+
+
+        lights[0] = (bins_smoothed[2] + bins_smoothed[3] + bins_smoothed[4]) / 2;
+        lights[1] = (bins_smoothed[5] + bins_smoothed[6] + bins_smoothed[7]) / 3;
+        lights[2] = (bins_smoothed[8] + bins_smoothed[9] + bins_smoothed[10]) / 3;
+        lights[3] = (bins_smoothed[11] + bins_smoothed[12] + bins_smoothed[13]) / 3;
+        lights[4] = (bins_smoothed[14] + bins_smoothed[15] + bins_smoothed[16]) / 3;
+        lights[5] = (bins_smoothed[17] + bins_smoothed[18] + bins_smoothed[19]) / 3;
+        lights[6] = (bins_smoothed[20] + bins_smoothed[21] + bins_smoothed[22]) / 3;
+        lights[7] = (bins_smoothed[23] + bins_smoothed[24] + bins_smoothed[25]) / 3;
+
+
+        for (int j = 0; j < 8; j++) {
+            int x = GRAPH_ORIGIN_X + (BAR_SPACING + BAR_WIDTH) * (8 + NUM_BINS);
+            int y = GRAPH_ORIGIN_Y + j * (BAR_WIDTH * 2 + BAR_SPACING * 2);
+            int h =  fmax(fmin(pow(lights[j], 2)/1000000, 255), 0);
+            output_levels[j] = h;
+            Fill(h, h, h, 1);
+            Roundrect(x, y, BAR_WIDTH*2, BAR_WIDTH*2, 20, 20);
+        }
+
+//        Fill(0, slide_up_val, 0, 1);
+//        Roundrect(1000, 680, BAR_WIDTH*2, BAR_WIDTH*2, 20, 20);
+//        slide_up_val -= 15;
+
+//        Fill(slide_down_val, 0, 0, 1);
+//        Roundrect(1100, 680, BAR_WIDTH*2, BAR_WIDTH*2, 20, 20);
+//        slide_down_val -= 15;
+
+        // printf("lower_diff_sum = %d, upper_diff_sum = %d \n", lower_diff_sum, upper_diff_sum);
+
+        End();
+
+        for (int i = 0; i < 8; i++) {
+            serial_send(arduino, i, output_levels[i]);
+        }
+
+    }
+
+
+
+
+
+    /********* FINISH *********/
+
+
+    finish();  // Graphics cleanup
+
+    serialClose(arduino) ;
+
+    free(buffer);
+    snd_pcm_close (capture_handle);
+    fprintf(stdout, "audio interface closed\n");
+    exit (0);
+
+}
