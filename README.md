@@ -3,7 +3,6 @@
 main logic is in histogram.c
 
 
-
 RUN:
     make
     ./h
